@@ -1,23 +1,41 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use reqwest::blocking::Client;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
+/// HLS 视频下载工具
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// 基础URL
+    #[arg(long)]
+    base_url: String,
+
+    /// m3u8路径
+    #[arg(long)]
+    m3u8_path: String,
+
+    /// 视频ID
+    #[arg(long)]
+    movie_id: String,
+}
+
 fn main() -> Result<()> {
+    let args = Args::parse();
+
     // 基本参数设置
-    let base_url =
-        "https://ev-h.phncdn.com/hls/videos/202406/22/454174481/1080P_4000K_454174481.mp4";
-    let m3u8_url = format!(
-        "{}/index-v1-a1.m3u8?validfrom=1740821945&validto=1740829145&ipa=101.32.241.181&hdl=-1&hash=kcSfaSfoiXRryHikzV5Bwh%2F24zs%3D",
-        base_url
-    );
-    let movie_id = "66769a91a6506";
+    let base_url = args.base_url;
+    let m3u8_path = args.m3u8_path;
+    let movie_id = args.movie_id;
+
+    let m3u8_url = format!("{}/{}", base_url, m3u8_path);
 
     // 创建输出目录（使用当前文件所在目录）
     let current_dir = std::env::current_dir()?;
     let output_dir = current_dir.join("output");
-    let movie_dir = output_dir.join(movie_id);
+    let movie_dir = output_dir.join(movie_id.clone());
     fs::create_dir_all(&movie_dir).context("创建输出目录失败")?;
 
     // 初始化 HTTP 客户端和请求头
