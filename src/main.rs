@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use rayon::prelude::*;
 use reqwest::blocking::Client;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -20,6 +21,69 @@ struct Args {
     /// 视频ID
     #[arg(long)]
     movie_id: String,
+
+    /// origin 头部
+    #[arg(long)]
+    origin: String,
+
+    /// referer 头部
+    #[arg(long)]
+    referer: String,
+
+    /// user-agent 头部
+    #[arg(long)]
+    user_agent: String,
+
+    /// 最大重试次数
+    #[arg(long, default_value_t = 3)]
+    max_retries: u32,
+
+    /// 分批次下载的批量大小
+    #[arg(long, default_value_t = 10)]
+    batch_size: usize,
+}
+
+fn get_ts_info(base_url: &str, line: &str) -> Result<(String, String)> {
+    let ts_url = line.split_once('?').map(|(s, _)| s).unwrap_or(line);
+    let ts_filename = Path::new(ts_url)
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("无法获取文件名: {}", ts_url))?
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("无法将文件名转换为字符串: {}", ts_url))?
+        .to_string();
+    Ok((format!("{}/{}", base_url, line.to_string()), ts_filename))
+}
+
+fn download_ts_file(
+    client: &Client,
+    headers: &reqwest::header::HeaderMap,
+    movie_dir: &Path,
+    ts_url: &str,
+    ts_filename: &str,
+    max_retries: u32,
+) -> Result<()> {
+    let mut retries = 0;
+    loop {
+        let ts_path = movie_dir.join(ts_filename);
+        println!("正在下载 {}", ts_path.display());
+        match client.get(ts_url).headers(headers.clone()).send() {
+            Ok(response) => {
+                let ts_content = response.bytes()?;
+                let mut file = File::create(&ts_path)?;
+                file.write_all(&ts_content)?;
+                break;
+            }
+            Err(e) => {
+                retries += 1;
+                if retries > max_retries {
+                    return Err(anyhow::anyhow!("下载失败: {}", e));
+                }
+                println!("下载失败，重试第 {} 次: {}", retries, e);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -29,6 +93,11 @@ fn main() -> Result<()> {
     let base_url = args.base_url;
     let m3u8_path = args.m3u8_path;
     let movie_id = args.movie_id;
+    let origin = args.origin;
+    let referer = args.referer;
+    let user_agent = args.user_agent;
+    let max_retries = args.max_retries;
+    let batch_size = args.batch_size;
 
     let m3u8_url = format!("{}/{}", base_url, m3u8_path);
 
@@ -43,17 +112,15 @@ fn main() -> Result<()> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::ORIGIN,
-        reqwest::header::HeaderValue::from_static("https://cn.pornhub.com"),
+        reqwest::header::HeaderValue::from_str(origin.as_str())?,
     );
     headers.insert(
         reqwest::header::REFERER,
-        reqwest::header::HeaderValue::from_static("https://cn.pornhub.com/"),
+        reqwest::header::HeaderValue::from_str(referer.as_str())?,
     );
     headers.insert(
         reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
+        reqwest::header::HeaderValue::from_str(user_agent.as_str())?,
     );
 
     // 下载 M3U8 文件内容
@@ -67,31 +134,29 @@ fn main() -> Result<()> {
     let m3u8_path = movie_dir.join(format!("{}.m3u8", movie_id));
     let mut m3u8_lines = Vec::new();
 
+    let ts_urls: Vec<(String, String)> = response
+        .lines()
+        .filter(|line| !line.starts_with("#"))
+        .map(|line| get_ts_info(&base_url, line))
+        .collect::<Result<Vec<_>>>()?;
+
+    // 分批次下载 TS 文件
+    for batch in ts_urls.chunks(batch_size) {
+        batch.par_iter().try_for_each(|(ts_url, ts_filename)| {
+            download_ts_file(
+                &client,
+                &headers,
+                &movie_dir,
+                ts_url,
+                ts_filename,
+                max_retries,
+            )
+        })?;
+    }
+
     for line in response.lines() {
         if !line.starts_with("#") {
-            // 解析 TS 文件 URL
-            let ts_url = line.split_once('?').map(|(s, _)| s).unwrap_or(line); // 获取不带查询参数的路径
-
-            // 生成本地文件路径
-            let ts_filename = Path::new(&ts_url).file_name().unwrap().to_str().unwrap();
-            let ts_path = movie_dir.join(ts_filename);
-
-            // 下载 TS 文件
-            println!("Downloading {}", ts_path.display());
-            let ts_content = client
-                .get(&format!("{}/{}", base_url, line))
-                .headers(headers.clone())
-                .send()?
-                .bytes()?;
-
-            // 移除前16个字节
-            // let ts_content = ts_content.slice(16..);
-
-            // 保存到本地
-            fs::write(&ts_path, &ts_content)
-                .with_context(|| format!("无法保存文件 {}", ts_path.display()))?;
-
-            // 构建 M3U8 条目
+            let (_, ts_filename) = get_ts_info(&base_url, line)?;
             m3u8_lines.push(format!("file://{}/{}", movie_dir.display(), ts_filename));
         } else {
             m3u8_lines.push(line.to_string());
